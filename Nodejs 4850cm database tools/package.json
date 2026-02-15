@@ -1,0 +1,22 @@
+{
+  "name": "checkswversion",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "node -e \"console.log(`Tests placeholder`)\""
+  },
+  "keywords": [],
+  "author": "MerijnHNE2",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "dotenv": "^17.2.3",
+    "fs": "^0.0.1-security",
+    "inquirer": "^8.2.7",
+    "mysql2": "^3.15.1",
+    "xlsx": "^0.18.5",
+    "xlsx-js-style": "^1.2.0"
+  }
+}

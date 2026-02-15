@@ -1,0 +1,1 @@
+pkg index.js --targets node18-win-x64 --output program.exe

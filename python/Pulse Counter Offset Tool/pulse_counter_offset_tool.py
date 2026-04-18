@@ -24,6 +24,8 @@ APP_FILE = Path(__file__).resolve()
 APP_DIR = APP_FILE.parent
 LOGO_PATH = APP_DIR / "logo_icy.svg"
 SCRIPTS_ROOT = APP_FILE.parents[3] if len(APP_FILE.parents) >= 4 else APP_DIR
+RUNTIME_LOG_DIR = Path.home() / "Documents" / "ICY-Logs"
+RUNTIME_LOG_PATH = RUNTIME_LOG_DIR / "pulse_counter_offset_tool.log"
 
 ENV_PATHS = [
     SCRIPTS_ROOT / "Toolkit" / ".env",
@@ -319,6 +321,45 @@ def build_comment_value():
         raise ValueError("Initialen zijn verplicht.")
     date_part = datetime.now().strftime("%d-%m-%Y")
     return f"{date_part} {initials}"
+
+
+def build_record_reference(record):
+    if record is None:
+        return "onbekend record"
+    get_value = record.get if hasattr(record, "get") else lambda key, default="": default
+    slave_id = str(get_value("slavedeviceid", "")).strip()
+    device_id = str(get_value("deviceid", "")).strip()
+    channel = str(get_value("channel", "")).strip()
+    parts = []
+    if slave_id:
+        parts.append(f"slavedeviceid={slave_id}")
+    if device_id:
+        parts.append(f"deviceid={device_id}")
+    if channel:
+        parts.append(f"channel={channel}")
+    return ", ".join(parts) if parts else "onbekend record"
+
+
+def write_runtime_log(message, level="INFO", record=None):
+    try:
+        RUNTIME_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        record_ref = build_record_reference(record)
+        line = f"[{timestamp}] [{level}] {message} | {record_ref}\n"
+        with RUNTIME_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+    except Exception:
+        pass
+
+
+def read_runtime_log_tail(max_lines=200):
+    try:
+        if not RUNTIME_LOG_PATH.exists():
+            return "Nog geen logregels beschikbaar."
+        lines = RUNTIME_LOG_PATH.read_text(encoding="utf-8").splitlines()
+        return "\n".join(lines[-max_lines:]) if lines else "Nog geen logregels beschikbaar."
+    except Exception:
+        return "Log kon niet worden gelezen."
 
 
 def to_plain_value(value):
@@ -865,11 +906,13 @@ def update_meterdivider(cur, device_id=None, slave_id=None, new_meterdivider=Non
             f"UPDATE {SLAVE_TABLE} SET meterdivider = %s WHERE slavedeviceid = %s",
             (divider, slave_id),
         )
+        write_runtime_log(f"Meterdivider gewijzigd van {current_divider} naar {divider}.", level="INFO", record={"slavedeviceid": slave_id, "deviceid": device_id})
     elif device_id:
         cur.execute(
             f"UPDATE {DEVICE_TABLE} SET meterdivider = %s WHERE deviceid = %s",
             (divider, device_id),
         )
+        write_runtime_log(f"Meterdivider gewijzigd van {current_divider} naar {divider}.", level="INFO", record={"deviceid": device_id})
 
 
 def save_offset(df):
@@ -880,6 +923,7 @@ def save_offset(df):
     try:
         for _, r in df.iterrows():
             if is_offset_edit_blocked(r):
+                write_runtime_log(MID_PROTECTED_METER_MESSAGE, level="WARN", record=r)
                 raise ValueError(MID_PROTECTED_METER_MESSAGE)
 
             device_id = str(r.get("deviceid", "")).strip() or None
@@ -905,6 +949,7 @@ def save_offset(df):
             )
 
             if abs(float(new_offset) - float(current_offset_raw or 0)) < 1e-12:
+                write_runtime_log("Geen wijziging opgeslagen omdat de berekende nieuwe offset gelijk is aan de huidige offset.", level="INFO", record=r)
                 continue
 
             if existing:
@@ -920,6 +965,7 @@ def save_offset(df):
                     """,
                     (device_id, slave_id, channel, new_offset, comment_value, existing[0])
                 )
+                write_runtime_log(f"Offset bijgewerkt naar raw waarde {new_offset}.", level="INFO", record=r)
             else:
                 cur.execute(
                     f"""
@@ -928,6 +974,7 @@ def save_offset(df):
                     """,
                     (device_id, slave_id, channel, new_offset, comment_value)
                 )
+                write_runtime_log(f"Nieuwe offset opgeslagen met raw waarde {new_offset}.", level="INFO", record=r)
 
         c.commit()
     finally:
@@ -1021,6 +1068,7 @@ def prepare_batch_preview(df, catalog):
             "new_meterdivider": src.get("new_meterdivider", ""),
             "match_count": int(len(candidates)),
             "match_status": "",
+            "status_detail": "",
             "location_label": "",
             "raw_reading": None,
             "raw_value": None,
@@ -1045,10 +1093,13 @@ def prepare_batch_preview(df, catalog):
 
         if desired_provided and pd.isna(src["desired"]):
             row["match_status"] = "Ongeldige meterstand"
+            row["status_detail"] = "Kolom new_meter_reading bevat geen geldige numerieke waarde."
         elif divider_provided and pd.isna(src["target_meterdivider"]):
             row["match_status"] = "Ongeldige meterdivider"
+            row["status_detail"] = "Kolom new_meterdivider bevat geen geldige positieve waarde."
         elif not desired_provided and not divider_provided:
             row["match_status"] = "Geen wijzigingen opgegeven"
+            row["status_detail"] = "Er is geen nieuwe meterstand of nieuwe meterdivider opgegeven."
         elif len(candidates) == 1:
             match = candidates.iloc[0]
             current_meterdivider = get_normalized_meterdivider(match.get("meterdivider", 1))
@@ -1081,16 +1132,20 @@ def prepare_batch_preview(df, catalog):
                 "devicetype_code": match.get("devicetype_code", ""),
                 "meter_variable": match.get("meter_variable", ""),
                 "match_status": "Geblokkeerd - MID Campère meter" if is_offset_edit_blocked(match) else "Klaar om op te slaan",
+                "status_detail": "MID-gecertificeerde Campère meter; tonen mag, aanpassen niet." if is_offset_edit_blocked(match) else "Deze wijziging voldoet aan de controles en kan worden opgeslagen.",
             })
         elif len(candidates) == 0:
             if src.get("deviceid", "") and not src.get("slavedeviceid", "") and device_has_slave_rows:
                 row["match_status"] = "DeviceID heeft Slavedevices - gebruik SlavedeviceID"
+                row["status_detail"] = "Dit DeviceID hoort bij een controller met meerdere slaves; gebruik daarom SlavedeviceID."
             else:
                 row["match_status"] = "Niet gevonden"
+                row["status_detail"] = "Geen match gevonden in de huidige database voor de opgegeven invoer."
         else:
             sample_locations = [str(v).strip() for v in candidates.get("location_label", pd.Series(dtype=str)).dropna().tolist() if str(v).strip()]
             row["location_label"] = " | ".join(sample_locations[:3])
             row["match_status"] = "Meerdere directe matches - controleer invoer"
+            row["status_detail"] = "Er zijn meerdere mogelijke matches gevonden; maak de invoer specifieker met SlavedeviceID of channel."
 
         preview_rows.append(row)
 
@@ -1576,7 +1631,10 @@ def main():
                 st.info(
                     f"Klaar: {len(valid_rows)} | Geblokkeerd: {len(blocked_rows)} | Meerdere matches: {len(ambiguous_rows)} | Niet gevonden: {len(missing_rows)} | Ongeldig: {len(invalid_rows)}"
                 )
+                st.caption("De tool schrijft ook een lokale log met redenen van skips, blokkades en opslagacties in je Documenten/ICY-Logs map.")
                 render_static_table(preview, max_height=420)
+                with st.expander("Toon laatste batchlog"):
+                    st.text_area("Batchlog", value=read_runtime_log_tail(), height=220, disabled=True)
 
                 if not blocked_rows.empty:
                     st.warning("Offsets voor MID gecertificeerde ICY 4850 Campère meters zijn geblokkeerd en worden niet opgeslagen.")
@@ -1597,9 +1655,16 @@ def main():
                     st.warning("Controleer de preview zorgvuldig. Batch opslaan kan in één keer veel offsets wijzigen.")
 
                 if st.button("Batch opslaan", disabled=valid_rows.empty or not batch_confirm):
+                    for _, r in preview.iterrows():
+                        status = str(r.get("match_status", "")).strip()
+                        detail = str(r.get("status_detail", "")).strip()
+                        if status and status != "Klaar om op te slaan":
+                            write_runtime_log(f"Batchregel niet opgeslagen: {status}. {detail}", level="WARN", record=r)
                     save_offset(valid_rows)
+                    write_runtime_log(f"Batch opgeslagen met {len(valid_rows)} geldige regel(s).", level="INFO")
                     st.success(f"Batch opgeslagen: {len(valid_rows)} regels")
             except Exception as e:
+                write_runtime_log(f"Batch verwerking mislukt: {e}", level="ERROR")
                 st.error(e)
 
 

@@ -78,6 +78,24 @@ def test_build_comment_value_requires_initials(monkeypatch):
         assert "Initialen zijn verplicht" in str(exc)
 
 
+def test_write_runtime_log_records_message_and_record_reference(tmp_path, monkeypatch):
+    log_path = tmp_path / "pulse_counter_offset_tool.log"
+    monkeypatch.setattr(pulse_tool, "RUNTIME_LOG_DIR", tmp_path)
+    monkeypatch.setattr(pulse_tool, "RUNTIME_LOG_PATH", log_path)
+    monkeypatch.setattr(pulse_tool, "datetime", FixedDatetime)
+
+    pulse_tool.write_runtime_log(
+        "Batchregel niet opgeslagen: Niet gevonden.",
+        level="WARN",
+        record={"slavedeviceid": "45", "deviceid": "25", "channel": "1"},
+    )
+
+    contents = log_path.read_text(encoding="utf-8")
+    assert "[WARN] Batchregel niet opgeslagen: Niet gevonden." in contents
+    assert "slavedeviceid=45" in contents
+    assert "deviceid=25" in contents
+
+
 def test_format_table_value_trims_only_unnecessary_decimals():
     assert pulse_tool.format_table_value(1000.0) == "1000"
     assert pulse_tool.format_table_value(294.0) == "294"
@@ -763,6 +781,7 @@ def test_prepare_batch_preview_marks_campere_rows_as_blocked():
     preview = pulse_tool.prepare_batch_preview(batch_df, catalog)
 
     assert preview.iloc[0]["match_status"] == "Geblokkeerd - MID Campère meter"
+    assert "MID" in preview.iloc[0]["status_detail"]
 
 
 def test_save_offset_rejects_mid_certified_campere_meter(monkeypatch):

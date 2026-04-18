@@ -725,6 +725,17 @@ def test_is_offset_edit_blocked_for_campere_meter():
     assert pulse_tool.is_offset_edit_blocked(row) is True
 
 
+def test_non_mid_filter_logic_can_exclude_mid_devices():
+    df = pd.DataFrame([
+        {"deviceid": "1", "offset_edit_blocked": True},
+        {"deviceid": "2", "offset_edit_blocked": False},
+    ])
+
+    filtered = df[~df["offset_edit_blocked"].fillna(False)]
+
+    assert filtered["deviceid"].tolist() == ["2"]
+
+
 def test_prepare_batch_preview_marks_campere_rows_as_blocked():
     catalog = pd.DataFrame(
         [

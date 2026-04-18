@@ -99,6 +99,7 @@ PERSISTED_STATE_DEFAULTS = {
     "location_filter": "",
     "device_filter": "",
     "slave_filter": "",
+    "mid_filter": "Alle meters",
     "selected_location": "Alle locaties",
     "search_text": "",
     "db_ready": False,
@@ -1177,6 +1178,13 @@ def main():
             location_input = st.text_input("Location filter (optioneel)", value=st.session_state.get("location_filter", ""))
             device_id_input = st.text_input("DeviceID (optioneel)", value=st.session_state.get("device_filter", ""))
             slave_device_id_input = st.text_input("SlaveDeviceID (optioneel)", value=st.session_state.get("slave_filter", ""))
+            mid_filter_input = st.selectbox(
+                "MID filter",
+                options=["Alle meters", "Alleen NON MID", "Alleen MID"],
+                index=["Alle meters", "Alleen NON MID", "Alleen MID"].index(
+                    st.session_state.get("mid_filter", "Alle meters")
+                ) if st.session_state.get("mid_filter", "Alle meters") in ["Alle meters", "Alleen NON MID", "Alleen MID"] else 0,
+            )
             submitted = st.form_submit_button("Database laden")
 
         if submitted:
@@ -1192,6 +1200,7 @@ def main():
             st.session_state["location_filter"] = location_input.strip()
             st.session_state["device_filter"] = device_id_input.strip()
             st.session_state["slave_filter"] = slave_device_id_input.strip()
+            st.session_state["mid_filter"] = mid_filter_input
             st.session_state["db_ready"] = True
             st.session_state["manual"] = None
             st.session_state["current_record_index"] = 0
@@ -1280,6 +1289,12 @@ def main():
         filtered = filtered[
             filtered["search_text"].fillna("").astype(str).str.contains(s, na=False)
         ]
+
+    mid_filter = st.session_state.get("mid_filter", "Alle meters")
+    if mid_filter == "Alleen NON MID" and "offset_edit_blocked" in filtered.columns:
+        filtered = filtered[~filtered["offset_edit_blocked"].fillna(False)]
+    elif mid_filter == "Alleen MID" and "offset_edit_blocked" in filtered.columns:
+        filtered = filtered[filtered["offset_edit_blocked"].fillna(False)]
 
     if "location_label" in filtered.columns:
         location_options = ["Alle locaties"] + sorted([loc for loc in filtered["location_label"].dropna().astype(str).unique().tolist() if loc.strip()])

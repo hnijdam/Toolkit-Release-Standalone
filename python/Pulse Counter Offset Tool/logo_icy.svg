@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="420" height="132" viewBox="0 0 420 132">
+  <rect width="420" height="132" fill="transparent"/>
+  <g fill="#11B8B5" stroke="#FFFFFF" stroke-width="4">
+    <circle cx="66" cy="66" r="48"/>
+    <circle cx="210" cy="66" r="48"/>
+    <circle cx="354" cy="66" r="48"/>
+  </g>
+  <g fill="#FFFFFF" font-family="Arial Black, Segoe UI, Arial, sans-serif" font-weight="700" font-size="62" text-anchor="middle" dominant-baseline="middle">
+    <text x="66" y="69">I</text>
+    <text x="210" y="69">C</text>
+    <text x="354" y="69">Y</text>
+  </g>
+</svg>

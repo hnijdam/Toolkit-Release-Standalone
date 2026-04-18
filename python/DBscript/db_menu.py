@@ -1298,6 +1298,7 @@ def main_menu():
         "Select a database and manage bridges",
         "Bridge health scan (alle bridges, export ca. 10 min)",
         "Poll fails scan (>15% fails, export)",
+        "Historische log backup (laatste 14 dagen)",
         "Exit"
     ]
     # Detect venv python.exe
@@ -1334,7 +1335,17 @@ def main_menu():
                     input("Druk op Enter om terug te keren naar het menu...")
                 except KeyboardInterrupt:
                     return
-            elif choice == 3 or choice is None or choice < 0:
+            elif choice == 3:
+                print("Historische log backup over de laatste 14 dagen wordt gestart...")
+                try:
+                    subprocess.call([venv_python, os.path.join(os.path.dirname(__file__), "backup_recent_logs.py"), "--days", "14"])
+                except Exception as e:
+                    print(f"Fout bij uitvoeren van de log backup: {e}")
+                try:
+                    input("Druk op Enter om terug te keren naar het menu...")
+                except KeyboardInterrupt:
+                    return
+            elif choice == 4 or choice is None or choice < 0:
                 break
             else:
                 print("Invalid choice")
@@ -1347,5 +1358,21 @@ def main_menu():
         print()
         return
 
+def run_manage_bridges_only():
+    databases = fetch_databases()
+    if not databases:
+        print("No databases available.")
+        return
+
+    db = choose_database(databases)
+    if not db:
+        return
+
+    manage_database_menu(db)
+
+
 if __name__ == '__main__':
-    main_menu()
+    if '--manage-bridges' in sys.argv:
+        run_manage_bridges_only()
+    else:
+        main_menu()

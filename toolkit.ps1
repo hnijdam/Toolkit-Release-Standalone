@@ -82,6 +82,32 @@ $servers = @(
 
 
 
+function Get-FreePort {
+    param (
+        [int]$StartPort = 8501,
+        [int]$EndPort = 8520
+    )
+
+    for ($port = $StartPort; $port -le $EndPort; $port++) {
+        $listener = $null
+        try {
+            $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port)
+            $listener.Start()
+            return $port
+        }
+        catch {
+            continue
+        }
+        finally {
+            if ($listener) {
+                try { $listener.Stop() } catch {}
+            }
+        }
+    }
+
+    throw "Geen vrije localhost-poort gevonden tussen $StartPort en $EndPort."
+}
+
 function Show-Menu {
 
 
@@ -1984,35 +2010,30 @@ function Show-ServiceMenu($server) {
 function Get-PythonExePath {
 
 
-    # Prefer workspace virtualenv, fallback to system python
+    # Prefer workspace virtualenvs, fallback to the Python launcher or system python
 
 
-    $workspaceVenv = Join-Path $PSScriptRoot "..\python\DBscript\venv\Scripts\python.exe"
-    if (Test-Path $workspaceVenv) { return $workspaceVenv }
+    $candidates = @(
+        (Join-Path $PSScriptRoot "python\DBscript\venv\Scripts\python.exe"),
+        (Join-Path $PSScriptRoot "python\DBscript\.venv\Scripts\python.exe"),
+        (Join-Path $PSScriptRoot "python\DBscript\virt-dahs\Scripts\python.exe"),
+        (Join-Path $PSScriptRoot "venv\Scripts\python.exe"),
+        (Join-Path $PSScriptRoot ".venv\Scripts\python.exe"),
+        (Join-Path $PSScriptRoot "virt-dahs\Scripts\python.exe")
+    )
 
-    $workspaceVenv = Join-Path $PSScriptRoot "..\python\DBscript\virt-dahs\Scripts\python.exe"
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) { return $candidate }
+    }
 
+    $releaseVenv = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+    if (Test-Path $releaseVenv) { return $releaseVenv }
 
-    if (Test-Path $workspaceVenv) { return $workspaceVenv }
-
-
-    # try common relative path
-
-
-    $venv2 = Join-Path $PSScriptRoot "..\virt-dahs\Scripts\python.exe"
-
-
-    if (Test-Path $venv2) { return $venv2 }
-
-
-    # fallback to python on PATH
-
+    $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+    if ($pyLauncher) { return $pyLauncher.Source }
 
     $py = Get-Command python -ErrorAction SilentlyContinue
-
-
     if ($py) { return $py.Source }
-
 
     return $null
 
@@ -2028,9 +2049,9 @@ function Show-BridgeComlogMenu {
         return
     }
 
-    $scriptPath = Join-Path $PSScriptRoot "..\Bridge TX\Bridge_Comlog_Viewer.py"
+    $scriptPath = Join-Path $PSScriptRoot "Bridge TX\Bridge_Comlog_Viewer.py"
     if (-not (Test-Path $scriptPath)) {
-        $scriptPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "..\Bridge TX\Bridge_Comlog_Viewer.py"
+        $scriptPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "Bridge TX\Bridge_Comlog_Viewer.py"
     }
     if (-not (Test-Path $scriptPath)) {
         Write-Host "Bridge_Comlog_Viewer.py not found at $scriptPath" -ForegroundColor Red
@@ -2064,7 +2085,7 @@ function Show-BridgeComlogMenu {
         return
     }
 
-    $envPath = Join-Path $PSScriptRoot "..\python\DBscript\.env"
+    $envPath = Join-Path $PSScriptRoot "python\DBscript\.env"
     if (-not (Test-Path $envPath)) {
         Write-Host ".env not found at $envPath" -ForegroundColor Red
         Pause
@@ -2126,37 +2147,119 @@ function Show-BridgeComlogMenu {
 }
 
 
+function Start-PulseCounterOffsetTool {
+    $scriptRoot = $PSScriptRoot
+    if ([string]::IsNullOrWhiteSpace($scriptRoot)) {
+        $scriptRoot = (Get-Location).Path
+    }
+
+    $launcherPath = Join-Path $scriptRoot "python\Pulse Counter Offset Tool\start_standalone.ps1"
+    if (-not (Test-Path $launcherPath)) {
+        Write-Host "start_standalone.ps1 not found at $launcherPath" -ForegroundColor Red
+        Pause
+        return
+    }
+
+    try {
+        Write-Host "Start Pulse Counter Offset Tool vanuit de Toolkit..." -ForegroundColor Yellow
+        & $launcherPath
+        Write-Host "Pulse Counter Offset Tool afgesloten." -ForegroundColor Green
+        Pause
+    }
+    catch {
+        Write-Host "Fout bij starten van Pulse Counter Offset Tool: $_" -ForegroundColor Red
+        Pause
+    }
+}
+
 function Show-BridgeScriptsMenu {
     while ($true) {
         $options = @(
-            "DB Menu (Python)",
+            "Bridgebeheer",
+            "Bridge health scan",
+            "Poll fails scan",
             "Bridge Comlog Viewer",
+            "Pulse Counter Offset Tool",
+            "Log backup (laatste 14 dagen)",
             "Terug"
         )
 
-        $selection = Show-Menu -Title "Bridge Scripts" -Options $options
+        $selection = Show-Menu -Title "DB Menu (Python)" -Options $options
 
-        if ($selection -eq 0) {
+        if ($selection -ge 0 -and $selection -le 5) {
             $py = Get-PythonExePath
             if (-not $py) {
                 Write-Host "Python executable not found. Please install Python or adjust the venv path." -ForegroundColor Red
                 Pause
                 continue
             }
+        }
 
-            $scriptPath = Join-Path $PSScriptRoot "..\python\DBscript\db_menu.py"
+        if ($selection -eq 0) {
+            $scriptPath = Join-Path $PSScriptRoot "python\DBscript\db_menu.py"
             if (-not (Test-Path $scriptPath)) {
                 Write-Host "db_menu.py not found at $scriptPath" -ForegroundColor Red
                 Pause
                 continue
             }
 
-            Write-Host "Starting DB menu..." -ForegroundColor Yellow
-            & $py $scriptPath
+            Write-Host "Starting bridge management menu..." -ForegroundColor Yellow
+            & $py $scriptPath --manage-bridges
             Pause
         }
         elseif ($selection -eq 1) {
+            $scriptPath = Join-Path $PSScriptRoot "python\DBscript\list_bridges_prompt.py"
+            if (-not (Test-Path $scriptPath)) {
+                Write-Host "list_bridges_prompt.py not found at $scriptPath" -ForegroundColor Red
+                Pause
+                continue
+            }
+
+            Write-Host "Bridge health scan wordt gestart..." -ForegroundColor Yellow
+            Push-Location (Split-Path -Parent $scriptPath)
+            try {
+                & $py $scriptPath --action all --export "./bridge_scan_menu_output" --gap-minutes 20 --window-days 4 --restart-window-threshold 20
+            }
+            finally {
+                Pop-Location
+            }
+            Pause
+        }
+        elseif ($selection -eq 2) {
+            $scriptPath = Join-Path $PSScriptRoot "python\DBscript\list_bridges_prompt.py"
+            if (-not (Test-Path $scriptPath)) {
+                Write-Host "list_bridges_prompt.py not found at $scriptPath" -ForegroundColor Red
+                Pause
+                continue
+            }
+
+            Write-Host "Poll fails scan wordt gestart..." -ForegroundColor Yellow
+            Push-Location (Split-Path -Parent $scriptPath)
+            try {
+                & $py $scriptPath --action pollall --export "./pollfail_menu_output" --poll-threshold 15
+            }
+            finally {
+                Pop-Location
+            }
+            Pause
+        }
+        elseif ($selection -eq 3) {
             Show-BridgeComlogMenu
+        }
+        elseif ($selection -eq 4) {
+            Start-PulseCounterOffsetTool
+        }
+        elseif ($selection -eq 5) {
+            $scriptPath = Join-Path $PSScriptRoot "python\DBscript\backup_recent_logs.py"
+            if (-not (Test-Path $scriptPath)) {
+                Write-Host "backup_recent_logs.py not found at $scriptPath" -ForegroundColor Red
+                Pause
+                continue
+            }
+
+            Write-Host "Start backup van database logs over de laatste 14 dagen..." -ForegroundColor Yellow
+            & $py $scriptPath --days 14
+            Pause
         }
         else {
             return
@@ -3171,7 +3274,7 @@ function Show-MainMenu {
         $menuOptions += "ICY4850CM Database Tools (Node.js)"
 
 
-        $menuOptions += "Bridge Script (Bèta PY)"
+        $menuOptions += "DB Menu (Python)"
 
 
         $menuOptions += "Afsluiten"

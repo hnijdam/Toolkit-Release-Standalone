@@ -510,7 +510,7 @@ def get_batch_preview_display_df(df):
 
 
 def get_batch_staging_editor_df(rows):
-    desired_columns = ["deviceid", "slavedeviceid", "channel", "new_meter_reading", "new_meterdivider"]
+    desired_columns = ["deviceid", "slavedeviceid", "new_meter_reading", "new_meterdivider"]
 
     if isinstance(rows, pd.DataFrame):
         df = rows.copy()
@@ -524,7 +524,7 @@ def get_batch_staging_editor_df(rows):
             df[col] = None if col == "new_meter_reading" else (1 if col == "new_meterdivider" else "")
 
     df = df[desired_columns].copy()
-    for col in ["deviceid", "slavedeviceid", "channel"]:
+    for col in ["deviceid", "slavedeviceid"]:
         df[col] = normalize_id_series(df[col])
 
     df["new_meter_reading"] = pd.to_numeric(df["new_meter_reading"], errors="coerce")
@@ -1836,12 +1836,11 @@ def main():
                 staged_df,
                 hide_index=True,
                 use_container_width=True,
-                disabled=["deviceid", "slavedeviceid", "channel"],
+                disabled=["deviceid", "slavedeviceid"],
                 num_rows="dynamic",
                 column_config={
                     "deviceid": st.column_config.TextColumn("DeviceID"),
                     "slavedeviceid": st.column_config.TextColumn("SlaveDeviceID"),
-                    "channel": st.column_config.TextColumn("Channel"),
                     "new_meter_reading": st.column_config.NumberColumn("Nieuwe meterstand", min_value=0.0, step=1.0, format="%g"),
                     "new_meterdivider": st.column_config.NumberColumn("Nieuwe meterdivider", min_value=1.0, step=1.0, format="%g"),
                 },

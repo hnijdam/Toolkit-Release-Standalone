@@ -2184,7 +2184,7 @@ function Show-BridgeScriptsMenu {
             "Terug"
         )
 
-        $selection = Show-Menu -Title "DB Menu (Python)" -Options $options
+        $selection = Show-Menu -Title "Python Scripts" -Options $options
 
         if ($selection -ge 0 -and $selection -le 5) {
             $py = Get-PythonExePath
@@ -3274,7 +3274,7 @@ function Show-MainMenu {
         $menuOptions += "ICY4850CM Database Tools (Node.js)"
 
 
-        $menuOptions += "DB Menu (Python)"
+        $menuOptions += "Python Scripts"
 
 
         $menuOptions += "Afsluiten"

@@ -114,6 +114,16 @@ function Get-FreePort {
     throw "Geen vrije localhost-poort gevonden tussen $StartPort en $EndPort."
 }
 
+function Wait-ToolkitContinue {
+    param(
+        [string]$Prompt = "Druk op Enter om terug te gaan naar het menu"
+    )
+
+    Write-Host ""
+    try { [Console]::CursorVisible = $true } catch {}
+    Read-Host $Prompt | Out-Null
+}
+
 function Show-Menu {
 
 
@@ -3275,10 +3285,12 @@ function Show-NodeToolsMenu {
 
 
 
-            Write-Host "Klaar. Druk op een toets om door te gaan..."
+            if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+                Write-Host "Node.js script beëindigd met exitcode $LASTEXITCODE." -ForegroundColor Yellow
+            }
 
-
-            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            $script:__menu_filter = ""
+            Wait-ToolkitContinue -Prompt "Node.js actie afgerond. Druk op Enter om terug te gaan naar het menu"
 
 
         }

@@ -378,114 +378,68 @@ async function fillSchemas(force = false) {
     }
 }
 
-async function execute_set_timedtask_allschemes() {
+async function execute_set_timedtask_allschemes(dryRun = false) {
     await fillSchemas();
+    console.log(chalk.bold.blue("************ TIMEDTASK TOEVOEGEN ALLE ORGANISATIES ************"));
+
+    if (dryRun) {
+        console.log(chalk.bgMagenta.white.bold("!!! DRY RUN MODE ACTIVE - GEEN WIJZIGINGEN WORDEN DOORGEVOERD !!!"));
+    }
+
     const pool = getPool();
     const connection = await pool.getConnection();
-    const rowsOut = [];
-    const allRevs = new Set();
+    const results = [];
+
     try {
         for (const schema of allSchemas) {
-            if (['information_schema', 'mysql', 'performance_schema', 'sys'].includes(schema)) continue;
+            if (['information_schema', 'mysql', 'performance_schema', 'sys', 'fixeddata'].includes(schema)) continue;
+
             try {
-                const [rows] = await connection.query(`SELECT curconfig, swversion FROM ${schema}.slavedevice WHERE slavedevid = 8705`);
-                let countUnder60 = 0;
-                const revCounts = {};
-                const rawSet = new Set();
-                for (const r of rows) {
-                    try {
-                        if (!r.curconfig || r.curconfig.length < 10) continue;
-                        const hex = r.curconfig.slice(8, 10);
-                        const sec = parseInt(hex, 16);
-                        if (!Number.isNaN(sec) && sec < 60) {
-                            countUnder60++;
-                            let revLabel = 'sw_unknown';
-                            if (r.swversion) {
-                                const sv = String(r.swversion).trim();
-                                rawSet.add(sv);
-                                let rev = null;
-                                const m = sv.match(/4850(\d{2})/);
-                                if (m) {
-                                    rev = m[1];
-                                } else {
-                                    const m2 = sv.match(/(\d{2})$/);
-                                    if (m2) rev = m2[1];
-                                }
-                                if (rev) revLabel = `sw${rev}`;
-                            }
-                            revCounts[revLabel] = (revCounts[revLabel] || 0) + 1;
-                            allRevs.add(revLabel);
-                        }
-                    } catch (e) { continue; }
+                const queryCheckExists = `SELECT * FROM ${schema}.timedtask WHERE taskhandle = 'ICY4850HARDWARECHECK'`;
+                const [rows] = await connection.query(queryCheckExists);
+
+                if (rows.length > 0) {
+                    console.log(chalk.gray(`Check: ${schema} heeft al een hardwarecheck timedtask. Overslaan...`));
+                    results.push({ schema, action: 'SKIPPED_EXISTS', executiontime: '' });
+                    continue;
                 }
-                if (countUnder60 > 0) {
-                    const rowObj = { Schema: schema, ModulesUnder60: countUnder60, RawSWVersions: Array.from(rawSet).join('; ') };
-                    Object.assign(rowObj, revCounts);
-                    rowsOut.push(rowObj);
+
+                const hour = Math.floor(Math.random() * 3) + 3;
+                const minute = Math.floor(Math.random() * 60);
+                const executiontime = `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
+                const queryAddTimedtask = `INSERT INTO ${schema}.timedtask (taskhandle, category, executioninterval, lastexecuted, executiontime, deadline) VALUES ("ICY4850HARDWARECHECK", 0, 1440, '1970-01-01 00:00:01', '${executiontime}', 60)`;
+
+                if (dryRun) {
+                    console.log(chalk.magenta(`[DRY RUN] ${schema} krijgt timedtask op ${executiontime}`));
+                    results.push({ schema, action: 'DRY_RUN_ADD', executiontime });
+                } else {
+                    console.log(chalk.yellow(`*** ${schema} krijgt timedtask op ${executiontime}. Toevoegen... ***`));
+                    await connection.query(queryAddTimedtask);
+                    results.push({ schema, action: 'ADDED', executiontime });
                 }
-            } catch (e) {
-                if (e && e.code === 'ER_NO_SUCH_TABLE') continue;
-                console.error(chalk.red(`Fout bij schema ${schema}: ${e.message || e}`));
+            } catch (error) {
+                if (error && error.code === 'ER_NO_SUCH_TABLE') {
+                    console.log(chalk.gray(`************ ${schema} heeft geen timedtask tabel. Overslaan. ************`));
+                    results.push({ schema, action: 'SKIPPED_NO_TABLE', executiontime: '' });
+                    continue;
+                }
+
+                console.error(chalk.red(`Fout bij schema ${schema}: ${error.message || error}`));
+                results.push({ schema, action: 'ERROR', executiontime: '', error: error.message || String(error) });
             }
         }
     } finally {
         try { connection.release(); } catch (e) {}
     }
 
-    const totalCustomers = rowsOut.length;
+    const addedCount = results.filter(r => r.action === 'ADDED').length;
+    const skippedCount = results.filter(r => r.action.startsWith('SKIPPED')).length;
+    const errorCount = results.filter(r => r.action === 'ERROR').length;
 
-    const ws = XLSX.utils.json_to_sheet(rowsOut);
-    const revCols = Array.from(allRevs).sort();
-    const unknownIndex = revCols.indexOf('sw_unknown');
-    if (unknownIndex !== -1) {
-        revCols.splice(unknownIndex, 1);
-        revCols.push('sw_unknown');
-    }
-    const headers = ['Schema', 'ModulesUnder60', ...revCols];
-    for (const r of rowsOut) {
-        for (const c of revCols) {
-            if (typeof r[c] === 'undefined') r[c] = 0;
-        }
-    }
+    console.log(chalk.green(`Klaar. Toegevoegd: ${addedCount} | Overgeslagen: ${skippedCount} | Fouten: ${errorCount}`));
+    writeLog(`TIMEDTASK SUMMARY: added=${addedCount}, skipped=${skippedCount}, errors=${errorCount}`);
 
-    const totals = { Schema: 'Totaal', ModulesUnder60: 0 };
-    for (const c of revCols) totals[c] = 0;
-    for (const r of rowsOut) {
-        totals.ModulesUnder60 += (r.ModulesUnder60 || 0);
-        for (const c of revCols) totals[c] += (r[c] || 0);
-    }
-    rowsOut.push(totals);
-
-    const wsOrdered = XLSX.utils.json_to_sheet(rowsOut, { header: headers });
-    if (rowsOut.length > 0 && wsOrdered['!ref']) {
-        const range = XLSX.utils.decode_range(wsOrdered['!ref']);
-        for (let col = range.s.c; col <= range.e.c; col++) {
-            const cellAddress = XLSX.utils.encode_cell({ r: 0, c: col });
-            if (!wsOrdered[cellAddress]) continue;
-            wsOrdered[cellAddress].s = { font: { bold: true, sz: 11 }, alignment: { vertical: 'center', horizontal: 'left' } };
-        }
-        wsOrdered['!autofilter'] = { ref: XLSX.utils.encode_range(range) };
-        const colsWidth = [ { wch: 40 }, { wch: 12 } ].concat(revCols.map(() => ({ wch: 12 })));
-        wsOrdered['!cols'] = colsWidth;
-    }
-
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, wsOrdered, 'Schakeltijden<60');
-    const filename = `icy4850_schakeltijden_under60_stats_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.xlsx`;
-    const fullPath = path.join(EXPORT_DIR, filename);
-    XLSX.writeFile(wb, fullPath, { cellStyles: true });
-
-    console.log(chalk.green(`STATISTIEK OPSLAAN GELUKT: ${fullPath}`));
-    console.log(chalk.green(`Totaal klanten met minimaal 1 module <60s: ${totalCustomers}`));
-
-    if (openAfter) {
-        try {
-            const openAnswer = await inquirer.prompt([{ type: 'confirm', name: 'open', message: 'Bestand openen?', default: true }]);
-            if (openAnswer.open) await openFile(fullPath);
-        } catch (e) { /* ignore */ }
-    }
-
-    return { path: fullPath, totalCustomers, rows: rowsOut };
+    return { addedCount, skippedCount, errorCount, results };
 }
 
 // Insert helper (adapted from bak/index.js). Uses a direct connection for compatibility with legacy behavior.
@@ -1539,7 +1493,9 @@ async function execute() {
 
         // handle actionChoice independently
         if (actionChoice === 'A') {
-            await execute_set_timedtask_allschemes();
+            const dryRunValue = String(extraArg || extraArg2 || '').toLowerCase();
+            const dryRunFlag = ['true', '1', 'yes', 'y', 'dryrun', '--dry-run', '-n'].includes(dryRunValue);
+            await execute_set_timedtask_allschemes(dryRunFlag);
         } else if (actionChoice === 'B') {
             await execute_add_settings();
         } else if (actionChoice === 'C') {

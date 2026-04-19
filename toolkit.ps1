@@ -64,16 +64,16 @@ $sshKey = if ($env:SSH_KEY_PATH) { $env:SSH_KEY_PATH } elseif ($env:SSH_KEY) { $
 $servers = @(
 
 
-    @{ Name = "Server 1"; HostName = "server1.example.com"; User = "user" },
+    @{ Name = "Ymir (Productie)"; HostName = "ymir.icy.nl"; User = "hnijdam" },
 
 
-    @{ Name = "Server 2"; HostName = "server2.example.com"; User = "user" },
+    @{ Name = "IcyCCCloud (Productie)"; HostName = "icycccloud.icy.nl"; User = "hnijdam" },
 
 
-    @{ Name = "Server 3"; HostName = "server3.example.com"; User = "user" },
+    @{ Name = "Dispatch (Productie)"; HostName = "dispatch.icy.nl"; User = "hnijdam" },
 
 
-    @{ Name = "Server 4"; HostName = "server4.example.com"; User = "user" }
+    @{ Name = "IcyCCAppAPI (Productie)"; HostName = "icyccappapi.icy.nl"; User = "hnijdam" }
 
 
 )

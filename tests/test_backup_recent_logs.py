@@ -62,3 +62,9 @@ def test_main_runs_all_database_backup_only_after_yes(monkeypatch):
     assert result == 7
     assert len(run_calls) == 1
     assert run_calls[0]["requested_databases"] is None
+
+
+def test_target_tables_include_hardware_issue_backup():
+    table_names = [table_name for table_name, _candidates in backup_recent_logs.TARGET_TABLES]
+
+    assert "icy4850hardwareissue" in table_names

@@ -32,6 +32,7 @@ TARGET_TABLES = [
     ("failedcommunication", ["failedcommunication"]),
     ("measurementlog", ["measurementlog", "measurmentlog"]),
     ("powerchangelog", ["powerchangelog"]),
+    ("icy4850hardwareissue", ["icy4850hardwareissue"]),
 ]
 
 SYSTEM_DATABASES = {
@@ -501,11 +502,6 @@ def export_table(
         cur.close()
 
     if row_count == 0:
-        try:
-            csv_path.unlink(missing_ok=True)
-            sql_path.unlink(missing_ok=True)
-        except Exception:
-            pass
         return {
             "host": host,
             "database": database,

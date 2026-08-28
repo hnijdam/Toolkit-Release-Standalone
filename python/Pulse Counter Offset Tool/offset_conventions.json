@@ -1,0 +1,22 @@
+{
+  "additive_devicetype_codes": [
+    "CAMPEREWS",
+    "CAMPEREMOD",
+    "PRMCAMPERE"
+  ],
+  "additive_meter_variables": [
+    "campere_wall_socket",
+    "campere_module",
+    "prm_campere_meter"
+  ],
+  "subtract_devicetype_codes": [],
+  "subtract_meter_variables": [],
+  "factor_overrides": [
+    {
+      "deviceid": "14",
+      "slavedeviceid": "55",
+      "factor": 5.0,
+      "note": "Confirmed ICY4940/ICY5247 Campere factor convention on 2026-08-25."
+    }
+  ]
+}

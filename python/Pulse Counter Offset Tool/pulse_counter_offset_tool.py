@@ -1,5 +1,7 @@
 import os
 import re
+import time
+import json
 from datetime import datetime
 from io import BytesIO
 from numbers import Number
@@ -24,6 +26,7 @@ SENDLIST_TABLE = "sendlist"
 APP_FILE = Path(__file__).resolve()
 APP_DIR = APP_FILE.parent
 LOGO_PATH = APP_DIR / "logo_icy.svg"
+OFFSET_CONVENTIONS_PATH = APP_DIR / "offset_conventions.json"
 SCRIPTS_ROOT = APP_FILE.parents[3] if len(APP_FILE.parents) >= 4 else APP_DIR
 DEFAULT_RUNTIME_LOG_DIR = Path.home() / "Documents" / "ICY-Logs"
 RUNTIME_LOG_DIR = DEFAULT_RUNTIME_LOG_DIR
@@ -130,24 +133,78 @@ MID_PROTECTED_DEVICETYPE_CODES = {
     "campctrl",
 }
 
-# Confirmed meters where the stored `offset` column is NOT a raw pulse offset, but a small value
-# denominated in "kWh / factor" units that ICY adds directly to raw_reading (no meterdivider
-# division). Verified for deviceid=14/slavedeviceid=55 (ICY4940 Campère controller, ICY5247 PRM
-# campère meter) on 2026-08-25: offset=361.2179, raw=1114501, meterdivider=2000
-# => effective = raw/2000 + 5*361.2179 = 2363.34.
-# Scoped to this exact device/slave pair on purpose: only add other meters here once each has been
-# independently confirmed against its own known-correct reading. Do not key this by devicetype_code
-# alone, since other meters of the same type may already have valid offsets under the default
-# (raw-pulse) convention.
-OFFSET_FACTOR_OVERRIDES = {
-    ("14", "55"): 5.0,
+DEFAULT_OFFSET_CONVENTIONS = {
+    "additive_devicetype_codes": ["CAMPEREWS", "CAMPEREMOD", "PRMCAMPERE"],
+    "additive_meter_variables": ["campere_wall_socket", "campere_module", "prm_campere_meter"],
+    "subtract_devicetype_codes": [],
+    "subtract_meter_variables": [],
+    "factor_overrides": [
+        {
+            "deviceid": "14",
+            "slavedeviceid": "55",
+            "factor": 5.0,
+            "note": "Confirmed ICY4940/ICY5247 Campere factor convention on 2026-08-25.",
+        }
+    ],
 }
+
+
+def _normalize_convention_items(values):
+    if not isinstance(values, (list, tuple, set)):
+        return set()
+    return {normalize_protection_text(value) for value in values if normalize_protection_text(value)}
+
+
+def load_offset_conventions():
+    conventions = dict(DEFAULT_OFFSET_CONVENTIONS)
+    try:
+        if OFFSET_CONVENTIONS_PATH.exists():
+            with OFFSET_CONVENTIONS_PATH.open("r", encoding="utf-8") as fh:
+                configured = json.load(fh)
+            if isinstance(configured, dict):
+                conventions.update({key: value for key, value in configured.items() if value is not None})
+    except Exception as exc:
+        write_runtime_log(f"Offsetconventie-config kon niet worden gelezen; standaardregels gebruikt: {exc}", level="WARN")
+    return conventions
 
 
 def get_offset_factor_override(device_id="", slave_id=""):
     """Return the confirmed offset-factor override for this exact device/slave pair, or None otherwise."""
     key = (normalize_id_value(device_id), normalize_id_value(slave_id))
-    return OFFSET_FACTOR_OVERRIDES.get(key)
+    for override in load_offset_conventions().get("factor_overrides", []):
+        if not isinstance(override, dict):
+            continue
+        override_key = (
+            normalize_id_value(override.get("deviceid", "")),
+            normalize_id_value(override.get("slavedeviceid", "")),
+        )
+        if override_key == key:
+            try:
+                return float(override.get("factor"))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def get_offset_mode(row=None, devicetype_code="", meter_variable=""):
+    """Return how the regular stored offset should be applied for this meter."""
+    if row is not None:
+        devicetype_code = row.get("devicetype_code", row.get("devicename", devicetype_code))
+        meter_variable = row.get("meter_variable", meter_variable)
+
+    code = normalize_protection_text(devicetype_code)
+    variable = normalize_protection_text(meter_variable)
+    conventions = load_offset_conventions()
+    subtract_codes = _normalize_convention_items(conventions.get("subtract_devicetype_codes", []))
+    subtract_variables = _normalize_convention_items(conventions.get("subtract_meter_variables", []))
+    if code in subtract_codes or variable in subtract_variables:
+        return "subtract"
+
+    additive_codes = _normalize_convention_items(conventions.get("additive_devicetype_codes", []))
+    additive_variables = _normalize_convention_items(conventions.get("additive_meter_variables", []))
+    if code in additive_codes or variable in additive_variables:
+        return "add"
+    return "subtract"
 
 
 def normalize_protection_text(value):
@@ -326,14 +383,17 @@ def get_normalized_meterdivider(value, default=1.0):
     return divider
 
 
-def calculate_effective_reading(raw_value, offset_value_raw=0, meterdivider=1, offset_factor=None):
+def calculate_effective_reading(raw_value, offset_value_raw=0, meterdivider=1, offset_factor=None, offset_mode="subtract"):
     """Calculate the displayed (effective) meter reading.
 
-    Default convention:
+    Default subtract convention:
+        effective = (raw_value - offset_value_raw) / meterdivider
+
+    Additive convention, used by confirmed Campère Plug/module meters:
         effective = (raw_value + offset_value_raw) / meterdivider
 
     - `raw_value` is the stored raw counter (pulses/ticks).
-    - `offset_value_raw` is the stored correction in raw units.
+    - `offset_value_raw` is the stored baseline/correction in raw units.
     - `meterdivider` scales raw -> displayed units (displayed = raw / meterdivider).
 
     Override (ICY factor) convention, when `offset_factor` is given (see OFFSET_FACTOR_OVERRIDES):
@@ -349,13 +409,19 @@ def calculate_effective_reading(raw_value, offset_value_raw=0, meterdivider=1, o
     divider = get_normalized_meterdivider(meterdivider)
     if offset_factor:
         return (float(raw_value or 0) / divider) + (float(offset_factor) * float(offset_value_raw or 0))
-    return (float(raw_value or 0) + float(offset_value_raw or 0)) / divider
+    if offset_mode == "add":
+        return (float(raw_value or 0) + float(offset_value_raw or 0)) / divider
+    return (float(raw_value or 0) - float(offset_value_raw or 0)) / divider
 
 
-def calculate_new_offset_raw(desired_meter_reading, raw_value, meterdivider=1, offset_factor=None):
+def calculate_new_offset_raw(desired_meter_reading, raw_value, meterdivider=1, offset_factor=None, offset_mode="subtract"):
     """Compute the offset that must be stored so the displayed reading equals `desired_meter_reading`.
 
-    Default convention:
+    Default subtract convention:
+        desired = (raw_value - new_offset_raw) / meterdivider
+        => new_offset_raw = raw_value - desired * meterdivider
+
+    Additive convention, used by confirmed Campère Plug/module meters:
         desired = (raw_value + new_offset_raw) / meterdivider
         => new_offset_raw = desired * meterdivider - raw_value
 
@@ -370,14 +436,23 @@ def calculate_new_offset_raw(desired_meter_reading, raw_value, meterdivider=1, o
 
     Example (default convention):
     - raw_value=3406060, meterdivider=1000, desired=0.634
-      new_offset_raw = 0.634*1000 - 3406060 = -3405426
+      new_offset_raw = 3406060 - 0.634*1000 = 3405426
     """
     divider = get_normalized_meterdivider(meterdivider)
     if desired_meter_reading is None or pd.isna(desired_meter_reading):
         return 0.0
     if offset_factor:
         return (float(desired_meter_reading) - (float(raw_value or 0) / divider)) / float(offset_factor)
-    return (float(desired_meter_reading) * divider) - float(raw_value or 0)
+    if offset_mode == "add":
+        return (float(desired_meter_reading) * divider) - float(raw_value or 0)
+    return float(raw_value or 0) - (float(desired_meter_reading) * divider)
+
+
+def calculate_target_meter_reading(input_value, current_effective_reading=0, adjustment_mode="set"):
+    value = float(input_value or 0)
+    if adjustment_mode == "add":
+        return float(current_effective_reading or 0) + value
+    return value
 
 
 def get_default_initials():
@@ -624,6 +699,39 @@ def format_table_value(value):
     return value
 
 
+def dataframe_to_excel_bytes(sheets):
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        for sheet_name, df in sheets.items():
+            safe_name = str(sheet_name)[:31] or "Sheet"
+            sheet_df = df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
+            sheet_df.to_excel(writer, index=False, sheet_name=safe_name)
+    return buffer.getvalue()
+
+
+def append_session_audit(action, record=None, **details):
+    try:
+        get_value = record.get if hasattr(record, "get") else lambda key, default="": default
+        row = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "action": action,
+            "deviceid": normalize_id_value(details.pop("deviceid", get_value("deviceid", ""))),
+            "slavedeviceid": normalize_id_value(details.pop("slavedeviceid", get_value("slavedeviceid", ""))),
+            "channel": normalize_id_value(details.pop("channel", get_value("channel", ""))),
+            "location_label": get_value("location_label", ""),
+            "meter_type_label": get_value("meter_type_label", ""),
+        }
+        row.update(details)
+        st.session_state.setdefault("session_audit", []).append(row)
+    except Exception:
+        pass
+
+
+def get_session_audit_df():
+    audit_rows = st.session_state.get("session_audit", [])
+    return pd.DataFrame(audit_rows) if audit_rows else pd.DataFrame()
+
+
 def get_batch_preview_display_df(df):
     if not isinstance(df, pd.DataFrame):
         return df
@@ -645,6 +753,28 @@ def get_batch_preview_display_df(df):
     ]
     available_columns = [col for col in visible_columns if col in df.columns]
     return df[available_columns].copy() if available_columns else df.copy()
+
+
+def get_refresh_status_display_df(statuses):
+    if not statuses:
+        return pd.DataFrame()
+    df = pd.DataFrame(statuses)
+    visible_columns = [
+        "status",
+        "deviceid",
+        "slavedeviceid",
+        "channel",
+        "previous_raw_value",
+        "new_raw_value",
+        "stored_offset_raw",
+        "expected_effective",
+        "actual_effective",
+        "effective_diff",
+        "pulsecounterlogid",
+        "timestamp",
+    ]
+    available_columns = [col for col in visible_columns if col in df.columns]
+    return df[available_columns].copy()
 
 
 def get_batch_staging_editor_df(rows):
@@ -1152,10 +1282,15 @@ def build_catalog(log_df, slave_df, offset_df, device_df=None, location_df=None,
     merged["offset_factor"] = merged.apply(
         lambda row: get_offset_factor_override(row.get("deviceid", ""), row.get("slavedeviceid", "")), axis=1
     )
+    merged["offset_mode"] = merged.apply(get_offset_mode, axis=1)
     _offset_factor_num = pd.to_numeric(merged["offset_factor"], errors="coerce")
     _has_offset_factor = _offset_factor_num.notna() & (_offset_factor_num != 0)
+    _additive_offset = merged["offset_mode"].eq("add")
     merged["current_offset"] = merged["offset_value_raw"] / merged["meterdivider"]
-    merged["effective_reading"] = merged["raw_reading"] + merged["current_offset"]
+    merged["effective_reading"] = merged["raw_reading"] - merged["current_offset"]
+    merged.loc[_additive_offset, "effective_reading"] = (
+        merged.loc[_additive_offset, "raw_reading"] + merged.loc[_additive_offset, "current_offset"]
+    )
     merged.loc[_has_offset_factor, "effective_reading"] = (
         merged.loc[_has_offset_factor, "raw_reading"]
         + _offset_factor_num[_has_offset_factor] * merged.loc[_has_offset_factor, "offset_value_raw"]
@@ -1331,6 +1466,39 @@ def delete_offset_rows(database_name, pulsecounteroffsetids):
         c.close()
 
 
+def queue_counter_request_command(cur, device_id, record=None):
+    """Queue a 0x15 Request Counter Value command in the current DB transaction."""
+    if not device_id:
+        raise ValueError("DeviceID ontbreekt; RCV commando kan niet worden klaargezet.")
+
+    cur.execute(
+        f"SELECT address FROM {DEVICE_TABLE} WHERE deviceid = %s LIMIT 1",
+        (int(device_id),),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise ValueError(f"Device {device_id} niet gevonden in de database.")
+    address = row[0]
+
+    cur.execute(
+        f"""
+        INSERT INTO {SENDLIST_TABLE}
+            (devid, address, command, comment, priority, sureness,
+             starttime, lasttry, msgdata, retrystodo, newpincode)
+        VALUES
+            (0x21, %s, 0x15, 'erp RCV', 70, 1,
+             NOW(), '1970-01-01 00:00:01', '', 10, 3424)
+        """,
+        (address,),
+    )
+    write_runtime_log(
+        f"Request Counter Value commando automatisch klaargezet na offsetwijziging voor device {device_id} (address={address}).",
+        level="INFO",
+        record=record if record is not None else {"deviceid": str(device_id)},
+    )
+    return address
+
+
 def update_meterdivider(cur, device_id=None, slave_id=None, new_meterdivider=None, current_meterdivider=None):
     if new_meterdivider is None or pd.isna(new_meterdivider):
         return
@@ -1414,12 +1582,135 @@ def fetch_stored_offset_raw(cur, device_id=None, slave_id=None):
     return float(row[0] or 0)
 
 
-def save_offset(df):
+def has_newer_log_entry(latest_entry, previous_entry):
+    if latest_entry is None:
+        return False
+    if previous_entry is None:
+        return True
+
+    latest_id = latest_entry.get("pulsecounterlogid")
+    previous_id = previous_entry.get("pulsecounterlogid")
+    if latest_id is not None and previous_id is not None:
+        try:
+            return int(latest_id) > int(previous_id)
+        except (TypeError, ValueError):
+            pass
+
+    latest_timestamp = pd.to_datetime(latest_entry.get("timestamp"), errors="coerce")
+    previous_timestamp = pd.to_datetime(previous_entry.get("timestamp"), errors="coerce")
+    if pd.notna(latest_timestamp) and pd.notna(previous_timestamp):
+        return latest_timestamp > previous_timestamp
+
+    return False
+
+
+def build_refresh_status(request, latest_entry=None, status="timeout", timeout_seconds=75):
+    previous_entry = request.get("previous_entry") or {}
+    raw_value = latest_entry.get("value") if latest_entry else None
+    actual_effective = None
+    expected_effective = request.get("expected_effective")
+    effective_diff = None
+    if raw_value is not None and request.get("stored_offset_raw") is not None:
+        actual_effective = calculate_effective_reading(
+            raw_value,
+            request.get("stored_offset_raw"),
+            request.get("meterdivider", 1),
+            request.get("offset_factor"),
+            request.get("offset_mode", "subtract"),
+        )
+        if expected_effective is not None and not pd.isna(expected_effective):
+            effective_diff = float(actual_effective) - float(expected_effective)
+
+    return {
+        "status": status,
+        "deviceid": request.get("deviceid") or "",
+        "slavedeviceid": request.get("slavedeviceid") or "",
+        "channel": request.get("channel") or "",
+        "previous_pulsecounterlogid": previous_entry.get("pulsecounterlogid"),
+        "previous_raw_value": previous_entry.get("value"),
+        "pulsecounterlogid": latest_entry.get("pulsecounterlogid") if latest_entry else None,
+        "new_raw_value": raw_value,
+        "value": raw_value,
+        "timestamp": str(latest_entry.get("timestamp", "")) if latest_entry else "",
+        "stored_offset_raw": request.get("stored_offset_raw"),
+        "expected_effective": expected_effective,
+        "actual_effective": actual_effective,
+        "effective_diff": effective_diff,
+        "timeout_seconds": timeout_seconds if status == "timeout" else None,
+    }
+
+
+def wait_for_counter_refreshes(refresh_requests, timeout_seconds=75, poll_interval_seconds=2):
+    pending = [dict(request) for request in refresh_requests]
+    completed = []
+    latest_by_key = {}
+    deadline = time.monotonic() + max(1, float(timeout_seconds))
+
+    while pending and time.monotonic() < deadline:
+        c = conn(st.session_state.get("db_name"))
+        cur = c.cursor()
+        try:
+            still_pending = []
+            for request in pending:
+                latest_entry = fetch_latest_raw_log_entry(
+                    cur,
+                    device_id=request.get("deviceid"),
+                    slave_id=request.get("slavedeviceid"),
+                    channel=request.get("channel"),
+                )
+                request_key = (
+                    request.get("deviceid") or "",
+                    request.get("slavedeviceid") or "",
+                    request.get("channel") or "",
+                )
+                latest_by_key[request_key] = latest_entry
+                if has_newer_log_entry(latest_entry, request.get("previous_entry")):
+                    completed.append(build_refresh_status(request, latest_entry, status="updated", timeout_seconds=timeout_seconds))
+                else:
+                    still_pending.append(request)
+            pending = still_pending
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+            c.close()
+
+        if pending:
+            time.sleep(max(0.1, float(poll_interval_seconds)))
+
+    for request in pending:
+        request_key = (
+            request.get("deviceid") or "",
+            request.get("slavedeviceid") or "",
+            request.get("channel") or "",
+        )
+        completed.append(build_refresh_status(request, latest_by_key.get(request_key), status="timeout", timeout_seconds=timeout_seconds))
+
+    return completed
+
+
+def wait_for_counter_refresh(device_id=None, slave_id=None, channel=None, previous_entry=None, timeout_seconds=75, poll_interval_seconds=2):
+    statuses = wait_for_counter_refreshes(
+        [{
+            "deviceid": device_id,
+            "slavedeviceid": slave_id,
+            "channel": channel,
+            "previous_entry": previous_entry,
+        }],
+        timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+    )
+    return statuses[0] if statuses else build_refresh_status({}, None, timeout_seconds=timeout_seconds)
+
+
+def save_offset(df, wait_for_refresh=True):
     c = conn(st.session_state.get("db_name"))
     cur = c.cursor()
     comment_value = build_comment_value()
     verification_tolerance = 1e-6
     rounding_warnings = []
+    refresh_requests = []
 
     try:
         for _, r in df.iterrows():
@@ -1433,6 +1724,7 @@ def save_offset(df):
             current_meterdivider = get_normalized_meterdivider(r.get("current_meterdivider", r.get("meterdivider", 1)))
             new_meterdivider = r.get("new_meterdivider", current_meterdivider)
             offset_factor = get_offset_factor_override(r.get("deviceid", ""), r.get("slavedeviceid", ""))
+            offset_mode = get_offset_mode(r)
 
             fallback_raw_value = float(r.get("raw_value", float(r.get("raw_reading", 0) or 0) * current_meterdivider) or 0)
             current_offset_raw = r.get("offset_value_raw", None)
@@ -1458,15 +1750,25 @@ def save_offset(df):
                     raw_value_for_calc,
                     new_meterdivider,
                     offset_factor,
+                    offset_mode,
                 )
             else:
                 new_offset = r.get("new_offset", current_offset_raw)
                 if new_offset is None or pd.isna(new_offset):
                     new_offset = current_offset_raw
+                if wait_for_refresh:
+                    live_log_entry = fetch_latest_raw_log_entry(
+                        cur,
+                        device_id=device_id,
+                        slave_id=slave_id,
+                        channel=channel,
+                    )
+                    raw_value_for_calc = float(live_log_entry["value"]) if live_log_entry else fallback_raw_value
 
             # pulsecounteroffset.offset is int(11); round explicitly instead of relying on MySQL's implicit cast.
             new_offset = float(round(float(new_offset)))
 
+            rcv_device_id = device_id
             parent_device_id_for_orphan_check = device_id
             existing, device_id, slave_id = find_existing_offset(cur, device_id=device_id, slave_id=slave_id)
             orphaned_parent = (
@@ -1502,6 +1804,7 @@ def save_offset(df):
                     raw_value_for_calc,
                     new_meterdivider,
                     offset_factor,
+                    offset_mode,
                 )
                 new_offset = float(round(new_offset))
 
@@ -1537,13 +1840,45 @@ def save_offset(df):
                     level="INFO",
                     record=r,
                 )
+                queue_counter_request_command(cur, rcv_device_id, record=r)
+                refresh_requests.append({
+                    "deviceid": rcv_device_id,
+                    "slavedeviceid": slave_id,
+                    "channel": channel,
+                    "previous_entry": live_log_entry,
+                    "record": r,
+                    "stored_offset_raw": new_offset,
+                    "meterdivider": new_meterdivider,
+                    "offset_factor": offset_factor,
+                    "offset_mode": offset_mode,
+                    "expected_effective": (
+                        float(desired_meter_reading)
+                        if desired_meter_reading is not None
+                        else r.get("resulting_effective_reading")
+                    ),
+                })
+                append_session_audit(
+                    "offset_saved",
+                    r,
+                    deviceid=rcv_device_id,
+                    slavedeviceid=slave_id,
+                    channel=channel,
+                    old_effective=r.get("effective_reading", ""),
+                    target_effective=desired_meter_reading if desired_meter_reading is not None else r.get("new_meter_reading", ""),
+                    raw_at_save=raw_value_for_calc,
+                    stored_offset_raw=new_offset,
+                    meterdivider=new_meterdivider,
+                    offset_mode=offset_mode,
+                    offset_factor=offset_factor or "",
+                    rcv_command="0x15 queued",
+                )
 
             if desired_meter_reading is not None:
                 stored_offset_raw = fetch_stored_offset_raw(cur, device_id=device_id, slave_id=slave_id)
                 if stored_offset_raw is None:
                     raise RuntimeError("Offset verificatie mislukt: opgeslagen offset kon niet worden teruggelezen.")
 
-                verified_effective = calculate_effective_reading(raw_value_for_calc, stored_offset_raw, new_meterdivider, offset_factor)
+                verified_effective = calculate_effective_reading(raw_value_for_calc, stored_offset_raw, new_meterdivider, offset_factor, offset_mode)
                 verified_diff = abs(float(verified_effective) - float(desired_meter_reading))
                 # pulsecounteroffset.offset is int(11): a factor-scoped offset (small stored values) can be
                 # off by up to 0.5 raw unit after rounding, which becomes 0.5*offset_factor kWh once applied.
@@ -1575,13 +1910,50 @@ def save_offset(df):
             pass
         c.close()
 
+    refresh_statuses = []
+    if wait_for_refresh and refresh_requests:
+        refresh_statuses = wait_for_counter_refreshes(refresh_requests)
+        request_by_key = {
+            (request.get("deviceid") or "", request.get("slavedeviceid") or "", request.get("channel") or ""): request
+            for request in refresh_requests
+        }
+        for status in refresh_statuses:
+            request = request_by_key.get((status.get("deviceid") or "", status.get("slavedeviceid") or "", status.get("channel") or ""), {})
+            if status["status"] == "updated":
+                write_runtime_log(
+                    f"RCV antwoord verwerkt: nieuwe pulsecounterlog id={status.get('pulsecounterlogid')} value={status.get('value')} timestamp={status.get('timestamp')} actual={status.get('actual_effective')} expected={status.get('expected_effective')}.",
+                    level="INFO",
+                    record=request.get("record"),
+                )
+            else:
+                write_runtime_log(
+                    f"Timeout bij wachten op RCV antwoord na {status.get('timeout_seconds')} seconden.",
+                    level="WARN",
+                    record=request.get("record"),
+                )
+            append_session_audit(
+                f"rcv_{status.get('status')}",
+                request.get("record"),
+                deviceid=status.get("deviceid", ""),
+                slavedeviceid=status.get("slavedeviceid", ""),
+                channel=status.get("channel", ""),
+                previous_raw_value=status.get("previous_raw_value"),
+                new_raw_value=status.get("new_raw_value"),
+                stored_offset_raw=status.get("stored_offset_raw"),
+                expected_effective=status.get("expected_effective"),
+                actual_effective=status.get("actual_effective"),
+                effective_diff=status.get("effective_diff"),
+                pulsecounterlogid=status.get("pulsecounterlogid"),
+            )
+    st.session_state["last_save_refresh_statuses"] = refresh_statuses
     return rounding_warnings
 
 
-def delete_offset(df):
+def delete_offset(df, wait_for_refresh=True):
     c = conn(st.session_state.get("db_name"))
     cur = c.cursor()
     deleted_count = 0
+    refresh_requests = []
 
     try:
         for _, r in df.iterrows():
@@ -1590,6 +1962,16 @@ def delete_offset(df):
 
             device_id = str(r.get("deviceid", "")).strip() or None
             slave_id = str(r.get("slavedeviceid", "")).strip() or None
+            channel = str(r.get("channel", "")).strip() or None
+            rcv_device_id = device_id
+            previous_entry = None
+            if wait_for_refresh:
+                previous_entry = fetch_latest_raw_log_entry(
+                    cur,
+                    device_id=device_id,
+                    slave_id=slave_id,
+                    channel=channel,
+                )
 
             existing, _, _ = find_existing_offset(cur, device_id=device_id, slave_id=slave_id)
             if existing:
@@ -1598,15 +1980,58 @@ def delete_offset(df):
                     (existing[0],)
                 )
                 deleted_count += 1
+                queue_counter_request_command(cur, rcv_device_id, record=r)
+                refresh_requests.append({
+                    "deviceid": rcv_device_id,
+                    "slavedeviceid": slave_id,
+                    "channel": channel,
+                    "previous_entry": previous_entry,
+                    "record": r,
+                    "stored_offset_raw": 0,
+                    "meterdivider": r.get("new_meterdivider", r.get("meterdivider", r.get("current_meterdivider", 1))),
+                    "offset_factor": get_offset_factor_override(r.get("deviceid", ""), r.get("slavedeviceid", "")),
+                    "offset_mode": get_offset_mode(r),
+                    "expected_effective": None,
+                })
+                append_session_audit(
+                    "offset_deleted",
+                    r,
+                    deviceid=rcv_device_id,
+                    slavedeviceid=slave_id,
+                    channel=channel,
+                    rcv_command="0x15 queued",
+                )
 
         c.commit()
-        return deleted_count
     finally:
         try:
             cur.close()
         except Exception:
             pass
         c.close()
+
+    refresh_statuses = []
+    if wait_for_refresh and refresh_requests:
+        refresh_statuses = wait_for_counter_refreshes(refresh_requests)
+        request_by_key = {
+            (request.get("deviceid") or "", request.get("slavedeviceid") or "", request.get("channel") or ""): request
+            for request in refresh_requests
+        }
+        for status in refresh_statuses:
+            request = request_by_key.get((status.get("deviceid") or "", status.get("slavedeviceid") or "", status.get("channel") or ""), {})
+            append_session_audit(
+                f"rcv_after_delete_{status.get('status')}",
+                request.get("record"),
+                deviceid=status.get("deviceid", ""),
+                slavedeviceid=status.get("slavedeviceid", ""),
+                channel=status.get("channel", ""),
+                previous_raw_value=status.get("previous_raw_value"),
+                new_raw_value=status.get("new_raw_value"),
+                actual_effective=status.get("actual_effective"),
+                pulsecounterlogid=status.get("pulsecounterlogid"),
+            )
+    st.session_state["last_delete_refresh_statuses"] = refresh_statuses
+    return deleted_count
 
 
 def send_counter_request_command(device_id):
@@ -1620,32 +2045,8 @@ def send_counter_request_command(device_id):
     c = conn(db_name)
     cur = c.cursor()
     try:
-        cur.execute(
-            f"SELECT address FROM {DEVICE_TABLE} WHERE deviceid = %s LIMIT 1",
-            (int(device_id),),
-        )
-        row = cur.fetchone()
-        if not row:
-            raise ValueError(f"Device {device_id} niet gevonden in de database.")
-        address = row[0]
-
-        cur.execute(
-            f"""
-            INSERT INTO {SENDLIST_TABLE}
-                (devid, address, command, comment, priority, sureness,
-                 starttime, lasttry, msgdata, retrystodo, newpincode)
-            VALUES
-                (0x21, %s, 0x15, 'erp RCV', 70, 1,
-                 NOW(), '1970-01-01 00:00:01', '', 10, 3424)
-            """,
-            (address,),
-        )
+        address = queue_counter_request_command(cur, device_id, record={"deviceid": str(device_id)})
         c.commit()
-        write_runtime_log(
-            f"Request Counter Value commando verstuurd naar device {device_id} (address={address}).",
-            level="INFO",
-            record={"deviceid": str(device_id)},
-        )
         return address
     finally:
         try:
@@ -1744,10 +2145,11 @@ def prepare_batch_preview(df, catalog):
             current_meterdivider = get_normalized_meterdivider(match.get("meterdivider", 1))
             target_meterdivider = get_normalized_meterdivider(src["target_meterdivider"], current_meterdivider) if divider_provided else current_meterdivider
             offset_factor = get_offset_factor_override(match.get("deviceid", ""), match.get("slavedeviceid", ""))
+            offset_mode = get_offset_mode(match)
             raw_value = float(match.get("raw_value", float(match.get("raw_reading", 0) or 0) * current_meterdivider) or 0)
             current_offset_raw = float(match.get("offset_value_raw", float(match.get("current_offset", 0) or 0) * current_meterdivider) or 0)
             if desired_provided:
-                new_offset_raw = calculate_new_offset_raw(src["desired"], raw_value, target_meterdivider, offset_factor)
+                new_offset_raw = calculate_new_offset_raw(src["desired"], raw_value, target_meterdivider, offset_factor, offset_mode)
             else:
                 new_offset_raw = current_offset_raw
             if desired_provided:
@@ -1765,7 +2167,7 @@ def prepare_batch_preview(df, catalog):
                 "new_meterdivider": to_plain_value(target_meterdivider),
                 "current_offset": to_plain_value(match.get("current_offset", 0)),
                 "effective_reading": to_plain_value(match.get("effective_reading", 0)),
-                "resulting_effective_reading": to_plain_value(calculate_effective_reading(raw_value, new_offset_raw, target_meterdivider, offset_factor)),
+                "resulting_effective_reading": to_plain_value(calculate_effective_reading(raw_value, new_offset_raw, target_meterdivider, offset_factor, offset_mode)),
                 "offset_value_raw": to_plain_value(current_offset_raw),
                 "new_offset": to_plain_value(new_offset_raw),
                 "meter_type_label": match.get("meter_type_label", ""),
@@ -1871,6 +2273,44 @@ def main():
     if pending_rounding_warnings:
         for warning_message in pending_rounding_warnings:
             st.warning(warning_message)
+    pending_refresh_statuses = st.session_state.pop("last_save_refresh_statuses", None)
+    if pending_refresh_statuses:
+        updated_count = sum(1 for status in pending_refresh_statuses if status.get("status") == "updated")
+        timeout_count = sum(1 for status in pending_refresh_statuses if status.get("status") == "timeout")
+        if updated_count:
+            st.success(f"RCV verwerkt voor {updated_count} meter(s).")
+        if timeout_count:
+            st.warning(f"Timeout bij wachten op RCV voor {timeout_count} meter(s). Ververs later opnieuw of controleer de bridge.")
+        with st.expander("Laatste RCV-resultaat", expanded=True):
+            render_static_table(get_refresh_status_display_df(pending_refresh_statuses), max_height=240)
+    pending_delete_refresh_statuses = st.session_state.pop("last_delete_refresh_statuses", None)
+    if pending_delete_refresh_statuses:
+        updated_count = sum(1 for status in pending_delete_refresh_statuses if status.get("status") == "updated")
+        timeout_count = sum(1 for status in pending_delete_refresh_statuses if status.get("status") == "timeout")
+        if updated_count:
+            st.success(f"RCV na verwijderen verwerkt voor {updated_count} meter(s).")
+        if timeout_count:
+            st.warning(f"Timeout bij wachten op RCV na verwijderen voor {timeout_count} meter(s).")
+        with st.expander("Laatste RCV-resultaat na verwijderen", expanded=True):
+            render_static_table(get_refresh_status_display_df(pending_delete_refresh_statuses), max_height=240)
+
+    audit_df = get_session_audit_df()
+    if not audit_df.empty:
+        with st.expander(f"Sessie-audit ({len(audit_df)} events)"):
+            render_static_table(audit_df.tail(50), max_height=260)
+            audit_col1, audit_col2 = st.columns(2)
+            audit_col1.download_button(
+                "Download audit CSV",
+                data=audit_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"pulse_counter_session_audit_{datetime.now():%Y%m%d_%H%M%S}.csv",
+                mime="text/csv",
+            )
+            audit_col2.download_button(
+                "Download audit Excel",
+                data=dataframe_to_excel_bytes({"Audit": audit_df}),
+                file_name=f"pulse_counter_session_audit_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
     with st.expander("Database selectie", expanded=True):
         available_hosts = get_available_db_hosts()
@@ -2317,6 +2757,7 @@ def main():
                     current_meterdivider_dbg = get_normalized_meterdivider(row.get("meterdivider", 1))
                     current_offset_raw_dbg = float(row.get("offset_value_raw", float(row.get("current_offset", 0) or 0) * current_meterdivider_dbg) or 0)
                     offset_factor_dbg = get_offset_factor_override(row.get("deviceid", ""), row.get("slavedeviceid", ""))
+                    offset_mode_dbg = get_offset_mode(row)
 
                     if "value" in log_dbg.columns:
                         log_dbg["value"] = pd.to_numeric(log_dbg["value"], errors="coerce")
@@ -2333,7 +2774,7 @@ def main():
                     if not preview_dbg.empty and "value" in preview_dbg.columns:
                         preview_dbg["raw_reading@divider"] = preview_dbg["value"] / current_meterdivider_dbg
                         preview_dbg["effective@current_offset"] = preview_dbg["value"].apply(
-                            lambda v: calculate_effective_reading(v, current_offset_raw_dbg, current_meterdivider_dbg, offset_factor_dbg)
+                            lambda v: calculate_effective_reading(v, current_offset_raw_dbg, current_meterdivider_dbg, offset_factor_dbg, offset_mode_dbg)
                         )
 
                     dbg_cols = [
@@ -2370,6 +2811,7 @@ def main():
             raw_value = float(row.get("raw_value", row.get("raw_reading", 0)) or 0)
             current_offset_raw = float(row.get("offset_value_raw", float(row.get("current_offset", 0) or 0) * current_meterdivider) or 0)
             offset_factor = get_offset_factor_override(row.get("deviceid", ""), row.get("slavedeviceid", ""))
+            offset_mode = get_offset_mode(row)
             if offset_factor:
                 st.caption(f"⚠️ Voor deze specifieke meter geldt een afwijkende, geverifieerde offsetconventie (factor {offset_factor:g}).")
 
@@ -2392,19 +2834,31 @@ def main():
                     disabled=is_locked,
                 )
 
-            recalculated_effective = calculate_effective_reading(raw_value, current_offset_raw, new_meterdivider, offset_factor)
+            recalculated_effective = calculate_effective_reading(raw_value, current_offset_raw, new_meterdivider, offset_factor, offset_mode)
             st.caption(
                 f"Meterdivider: {current_meterdivider:g}" + (f" → {new_meterdivider:g}" if change_divider else "")
                 + f" | Huidige effectieve meterstand bij deze divider: {recalculated_effective:.6g}"
             )
 
-            desired = st.number_input(
-                "Nieuwe meterstand",
-                value=float(recalculated_effective),
-                key=f"desired_{row.get('deviceid', '')}_{row.get('slavedeviceid', '')}_{row.get('channel', '')}_{str(new_meterdivider).replace('.', '_')}",
+            adjustment_mode_label = st.radio(
+                "Wijziging",
+                options=["Zet meterstand op", "Tel op bij huidige stand"],
+                horizontal=True,
+                key=f"adjustment_mode_{row.get('deviceid', '')}_{row.get('slavedeviceid', '')}_{row.get('channel', '')}",
                 disabled=is_locked,
             )
+            adjustment_mode = "add" if adjustment_mode_label == "Tel op bij huidige stand" else "set"
+            desired_input_default = 0.0 if adjustment_mode == "add" else float(recalculated_effective)
+            desired_input = st.number_input(
+                "Op te tellen stand" if adjustment_mode == "add" else "Nieuwe meterstand",
+                value=desired_input_default,
+                key=f"desired_{adjustment_mode}_{row.get('deviceid', '')}_{row.get('slavedeviceid', '')}_{row.get('channel', '')}_{str(new_meterdivider).replace('.', '_')}",
+                disabled=is_locked,
+            )
+            desired = calculate_target_meter_reading(desired_input, recalculated_effective, adjustment_mode)
             st.caption("Bij opslaan wordt altijd opnieuw de nieuwste pulsecounterlog gelezen en daarop de offset berekend, zodat de doelstand op dat moment exact wordt gehaald.")
+            if adjustment_mode == "add":
+                st.caption(f"Doelstand bij opslaan: {desired:.6g}")
 
             preview_col, push_current_col, push_visible_col, save_col, delete_col = st.columns(5)
             record_payload = {
@@ -2419,9 +2873,11 @@ def main():
                 "current_offset": to_plain_value(row["current_offset"]),
                 "effective_reading": to_plain_value(row.get("effective_reading", recalculated_effective)),
                 "new_meter_reading": to_plain_value(desired),
+                "adjustment_mode": adjustment_mode,
+                "adjustment_input": to_plain_value(desired_input),
                 "offset_value_raw": to_plain_value(current_offset_raw),
-                "new_offset": to_plain_value(calculate_new_offset_raw(desired, raw_value, new_meterdivider, offset_factor)),
-                "resulting_effective_reading": to_plain_value(calculate_effective_reading(raw_value, calculate_new_offset_raw(desired, raw_value, new_meterdivider, offset_factor), new_meterdivider, offset_factor)),
+                "new_offset": to_plain_value(calculate_new_offset_raw(desired, raw_value, new_meterdivider, offset_factor, offset_mode)),
+                "resulting_effective_reading": to_plain_value(calculate_effective_reading(raw_value, calculate_new_offset_raw(desired, raw_value, new_meterdivider, offset_factor, offset_mode), new_meterdivider, offset_factor, offset_mode)),
                 "meter_type_label": row.get("meter_type_label", ""),
                 "devicetype_name": row.get("devicetype_name", ""),
                 "devicetype_code": row.get("devicetype_code", ""),
@@ -2478,7 +2934,8 @@ def main():
                 if not st.session_state.get("manual"):
                     st.warning("Eerst preview maken")
                 else:
-                    st.session_state["last_save_rounding_warnings"] = save_offset(pd.DataFrame([st.session_state["manual"]]))
+                    with st.spinner("Offset opgeslagen. RCV commando verstuurd; wachten op nieuwe pulsecounterwaarde..."):
+                        st.session_state["last_save_rounding_warnings"] = save_offset(pd.DataFrame([st.session_state["manual"]]))
                     st.cache_data.clear()
                     st.session_state["manual"] = None
                     st.session_state["current_record_index"] = (st.session_state["current_record_index"] + 1) % len(filtered)
@@ -2493,7 +2950,8 @@ def main():
                 disabled=is_locked or not has_current_offset,
             )
             if delete_col.button("Huidige offset verwijderen", disabled=is_locked or not has_current_offset or not confirm_delete):
-                deleted = delete_offset(pd.DataFrame([record_payload]))
+                with st.spinner("Offset verwijderd. RCV commando verstuurd; wachten op nieuwe pulsecounterwaarde..."):
+                    deleted = delete_offset(pd.DataFrame([record_payload]))
                 st.cache_data.clear()
                 st.session_state["manual"] = None
                 if deleted:
@@ -2623,6 +3081,23 @@ def main():
                 )
                 st.caption("De tool schrijft ook een lokale log met redenen van skips, blokkades en opslagacties in je Documenten/ICY-Logs map.")
                 render_static_table(get_batch_preview_display_df(preview), max_height=420)
+                dry_run_summary = pd.DataFrame([
+                    {"status": "Klaar om op te slaan", "count": len(valid_rows)},
+                    {"status": "Geblokkeerd", "count": len(blocked_rows)},
+                    {"status": "Meerdere matches", "count": len(ambiguous_rows)},
+                    {"status": "Niet gevonden", "count": len(missing_rows)},
+                    {"status": "Ongeldig", "count": len(invalid_rows)},
+                ])
+                st.download_button(
+                    "Download dry-run report Excel",
+                    data=dataframe_to_excel_bytes({
+                        "Preview": preview,
+                        "Zichtbaar": get_batch_preview_display_df(preview),
+                        "Samenvatting": dry_run_summary,
+                    }),
+                    file_name=f"pulse_counter_batch_dry_run_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
                 with st.expander("Toon laatste batchlog"):
                     st.text_area("Batchlog", value=read_runtime_log_tail(), height=220, disabled=True)
 
@@ -2651,7 +3126,8 @@ def main():
                         detail = str(r.get("status_detail", "")).strip()
                         if status and status != "Klaar om op te slaan":
                             write_runtime_log(f"Batchregel niet opgeslagen: {status}. {detail}", level="WARN", record=r)
-                    save_offset_warnings = save_offset(valid_rows)
+                    with st.spinner(f"Batch opgeslagen. RCV commando's verstuurd; wachten op {len(valid_rows)} nieuwe pulsecounterwaarde(n)..."):
+                        save_offset_warnings = save_offset(valid_rows)
                     write_runtime_log(f"Batch opgeslagen met {len(valid_rows)} geldige regel(s).", level="INFO")
                     st.session_state["last_save_rounding_warnings"] = save_offset_warnings
                     st.success(f"Batch opgeslagen: {len(valid_rows)} regels")

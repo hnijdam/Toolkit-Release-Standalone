@@ -120,6 +120,28 @@ def test_format_table_value_trims_only_unnecessary_decimals():
     assert pulse_tool.format_table_value(24.256) == "24.256"
 
 
+def test_calculate_target_meter_reading_can_set_absolute_value():
+    assert pulse_tool.calculate_target_meter_reading(3000, current_effective_reading=1.331, adjustment_mode="set") == 3000
+
+
+def test_calculate_target_meter_reading_can_add_to_current_value():
+    assert pulse_tool.calculate_target_meter_reading(3000, current_effective_reading=1.331, adjustment_mode="add") == 3001.331
+
+
+def test_has_newer_log_entry_detects_new_pulsecounterlog_id():
+    previous = {"pulsecounterlogid": 10, "timestamp": "2026-08-26 21:44:17"}
+    latest = {"pulsecounterlogid": 11, "timestamp": "2026-08-26 21:44:17"}
+
+    assert pulse_tool.has_newer_log_entry(latest, previous) is True
+
+
+def test_has_newer_log_entry_rejects_same_pulsecounterlog_id():
+    previous = {"pulsecounterlogid": 10, "timestamp": "2026-08-26 21:44:17"}
+    latest = {"pulsecounterlogid": 10, "timestamp": "2026-08-26 21:44:17"}
+
+    assert pulse_tool.has_newer_log_entry(latest, previous) is False
+
+
 def test_normalize_searchable_text_supports_location_search():
     assert pulse_tool.normalize_searchable_text("Villa - 14") == "villa 14"
     assert pulse_tool.normalize_searchable_text("Aardappelpand -- 023") == "aardappelpand 023"
@@ -205,7 +227,7 @@ def test_build_catalog_prefers_slave_offset_above_device_offset():
     direct_row = catalog[(catalog["deviceid"] == "9") & (catalog["slavedeviceid"] == "")].iloc[0]
 
     assert slave_row["current_offset"] == 1234
-    assert slave_row["effective_reading"] == 1570
+    assert slave_row["effective_reading"] == -898
     assert direct_row["current_offset"] == 7
 
 
@@ -258,7 +280,7 @@ def test_build_catalog_applies_meterdivider_to_display_values():
     assert row["meterdivider"] == 1000
     assert row["raw_reading"] == 2.103
     assert row["current_offset"] == 0.897
-    assert row["effective_reading"] == 3.0
+    assert abs(row["effective_reading"] - 1.206) < 1e-12
 
 
 def test_build_catalog_prefers_slave_meterdivider_over_device_meterdivider():
@@ -346,7 +368,100 @@ def test_prepare_batch_preview_uses_meterdivider_for_new_offset():
     preview = pulse_tool.prepare_batch_preview(batch_df, catalog)
 
     assert preview.iloc[0]["match_status"] == "Klaar om op te slaan"
-    assert preview.iloc[0]["new_offset"] == 2397
+    assert preview.iloc[0]["new_offset"] == -2397
+
+
+def test_prepare_batch_preview_sets_prm_offset_by_subtracting_from_raw_counter():
+    catalog = pd.DataFrame(
+        [
+            {
+                "deviceid": "8",
+                "slavedeviceid": "",
+                "channel": "",
+                "location_label": "PRM gasmeter",
+                "raw_reading": 55.151,
+                "raw_value": 55151,
+                "current_offset": 0,
+                "offset_value_raw": 0,
+                "effective_reading": 55.151,
+                "meterdivider": 1000,
+                "meter_type_label": "PRM gasmeter",
+                "devicetype_name": "PRM gasmeter",
+                "devicetype_code": "PRMGAS",
+                "meter_variable": "prm_gas_meter",
+            }
+        ]
+    )
+    batch_df = pd.DataFrame([{"deviceid": "8", "new_meter_reading": 10000}])
+
+    preview = pulse_tool.prepare_batch_preview(batch_df, catalog)
+    row = preview.iloc[0]
+
+    assert row["match_status"] == "Klaar om op te slaan"
+    assert row["new_offset"] == -9944849
+    assert row["resulting_effective_reading"] == 10000
+
+
+def test_prepare_batch_preview_keeps_campere_plug_additive_offset_convention():
+    catalog = pd.DataFrame(
+        [
+            {
+                "deviceid": "14",
+                "slavedeviceid": "",
+                "channel": "",
+                "location_label": "Campere plug",
+                "raw_reading": 2.103,
+                "raw_value": 2103,
+                "current_offset": 0.897,
+                "offset_value_raw": 897,
+                "effective_reading": 3.0,
+                "meterdivider": 1000,
+                "meter_type_label": "ICY4518 Campère wall socket",
+                "devicetype_name": "ICY4518 Campère wall socket",
+                "devicetype_code": "CAMPEREWS",
+                "meter_variable": "campere_wall_socket",
+            }
+        ]
+    )
+    batch_df = pd.DataFrame([{"deviceid": "14", "new_meter_reading": 4.5}])
+
+    preview = pulse_tool.prepare_batch_preview(batch_df, catalog)
+    row = preview.iloc[0]
+
+    assert row["match_status"] == "Klaar om op te slaan"
+    assert row["new_offset"] == 2397
+    assert row["resulting_effective_reading"] == 4.5
+
+
+def test_prepare_batch_preview_keeps_prm_campere_additive_offset_convention():
+    catalog = pd.DataFrame(
+        [
+            {
+                "deviceid": "8",
+                "slavedeviceid": "8706",
+                "channel": "",
+                "location_label": "ICY5247 PRM Campere",
+                "raw_reading": 2.157,
+                "raw_value": 2157,
+                "current_offset": 0,
+                "offset_value_raw": 0,
+                "effective_reading": 2.157,
+                "meterdivider": 1000,
+                "meter_type_label": "PRM campere meter",
+                "devicetype_name": "ICY5247 PRM campere meter",
+                "devicetype_code": "PRMCAMPERE",
+                "meter_variable": "prm_campere_meter",
+            }
+        ]
+    )
+    batch_df = pd.DataFrame([{"slavedeviceid": "8706", "deviceid": "8", "new_meter_reading": 3.0}])
+
+    preview = pulse_tool.prepare_batch_preview(batch_df, catalog)
+    row = preview.iloc[0]
+
+    assert row["match_status"] == "Klaar om op te slaan"
+    assert row["new_offset"] == 843
+    assert row["resulting_effective_reading"] == 3.0
 
 
 def test_prepare_batch_preview_supports_optional_meterdivider_change():
@@ -383,7 +498,7 @@ def test_prepare_batch_preview_supports_optional_meterdivider_change():
     assert row["current_meterdivider"] == 1000
     assert row["new_meterdivider"] == 100
     assert row["new_offset"] == 897
-    assert row["resulting_effective_reading"] == 30.0
+    assert row["resulting_effective_reading"] == 12.06
 
 
 def test_get_batch_preview_display_df_hides_internal_columns():
@@ -846,7 +961,7 @@ def test_save_offset_updates_existing_slave_record_and_sets_comment(monkeypatch)
     monkeypatch.setattr(pulse_tool, "st", fake_streamlit("HN"))
     monkeypatch.setattr(pulse_tool, "datetime", FixedDatetime)
 
-    cursor = FakeCursor(fetchone_results=[(15,)])
+    cursor = FakeCursor(fetchone_results=[(15,), (238,)])
     connection = FakeConnection(cursor)
     monkeypatch.setattr(pulse_tool, "conn", lambda database_name=None: connection)
 
@@ -861,7 +976,7 @@ def test_save_offset_updates_existing_slave_record_and_sets_comment(monkeypatch)
         ]
     )
 
-    pulse_tool.save_offset(df)
+    pulse_tool.save_offset(df, wait_for_refresh=False)
 
     assert connection.committed is True
     assert connection.closed is True
@@ -872,6 +987,11 @@ def test_save_offset_updates_existing_slave_record_and_sets_comment(monkeypatch)
     assert update_params[1] == "10002"
     assert update_params[4] == "16-04-2026 HN"
     assert update_params[5] == 15
+    assert f"SELECT address FROM {pulse_tool.DEVICE_TABLE}" in cursor.queries[2][0]
+    assert cursor.queries[2][1] == (2,)
+    assert f"INSERT INTO {pulse_tool.SENDLIST_TABLE}" in cursor.queries[3][0]
+    assert "0x15" in cursor.queries[3][0]
+    assert cursor.queries[3][1] == (238,)
 
 
 def test_save_offset_can_update_meterdivider_without_creating_zero_offset(monkeypatch):
@@ -897,7 +1017,7 @@ def test_save_offset_can_update_meterdivider_without_creating_zero_offset(monkey
         ]
     )
 
-    pulse_tool.save_offset(df)
+    pulse_tool.save_offset(df, wait_for_refresh=False)
 
     assert connection.committed is True
     assert connection.closed is True
@@ -985,7 +1105,7 @@ def test_save_offset_rejects_mid_certified_campere_meter(monkeypatch):
     )
 
     try:
-        pulse_tool.save_offset(df)
+        pulse_tool.save_offset(df, wait_for_refresh=False)
         assert False, "Expected Campère meter save to be blocked"
     except ValueError as exc:
         assert "MID" in str(exc)
@@ -1024,7 +1144,7 @@ def test_delete_offset_removes_existing_slave_record(monkeypatch):
     monkeypatch.setattr(pulse_tool, "st", fake_streamlit("HN"))
     monkeypatch.setattr(pulse_tool, "datetime", FixedDatetime)
 
-    cursor = FakeCursor(fetchone_results=[(15,)])
+    cursor = FakeCursor(fetchone_results=[(15,), (238,)])
     connection = FakeConnection(cursor)
     monkeypatch.setattr(pulse_tool, "conn", lambda database_name=None: connection)
 
@@ -1038,13 +1158,18 @@ def test_delete_offset_removes_existing_slave_record(monkeypatch):
         ]
     )
 
-    deleted = pulse_tool.delete_offset(df)
+    deleted = pulse_tool.delete_offset(df, wait_for_refresh=False)
 
     assert deleted == 1
     assert connection.committed is True
     assert connection.closed is True
     assert "WHERE slavedeviceid = %s" in cursor.queries[0][0]
     assert "DELETE FROM" in cursor.queries[1][0]
+    assert f"SELECT address FROM {pulse_tool.DEVICE_TABLE}" in cursor.queries[2][0]
+    assert cursor.queries[2][1] == (2,)
+    assert f"INSERT INTO {pulse_tool.SENDLIST_TABLE}" in cursor.queries[3][0]
+    assert "0x15" in cursor.queries[3][0]
+    assert cursor.queries[3][1] == (238,)
 
 
 def test_delete_offset_rejects_mid_certified_campere_meter(monkeypatch):
@@ -1070,7 +1195,7 @@ def test_delete_offset_rejects_mid_certified_campere_meter(monkeypatch):
     )
 
     try:
-        pulse_tool.delete_offset(df)
+        pulse_tool.delete_offset(df, wait_for_refresh=False)
         assert False, "Expected Campère meter delete to be blocked"
     except ValueError as exc:
         assert "MID" in str(exc)

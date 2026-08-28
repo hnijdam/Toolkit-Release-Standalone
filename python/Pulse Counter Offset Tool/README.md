@@ -24,3 +24,6 @@ Standalone Streamlit tool for viewing pulse counter readings, adjusting offsets,
 - `logo_icy.svg`
 
 See `DEPLOYMENT.md` for full installation and GitHub publishing instructions.
+
+See `OFFSET_BEHAVIOR.md` for the live-tested offset conventions, manual input
+modes, and RCV refresh behavior.
